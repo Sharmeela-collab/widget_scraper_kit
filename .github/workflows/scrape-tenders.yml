@@ -1,67 +1,230 @@
-name: Scrape Transport Tenders
+"""
+Debug version of the widget scraper.
 
-# Runs every 6 hours and on manual trigger.
-# Fully automated — no CAPTCHA, no human in the loop.
-on:
-  schedule:
-    - cron: "0 */6 * * *"   # every 6 hours UTC → 5:30, 11:30, 17:30, 23:30 IST
-  workflow_dispatch:          # also allow manual run from GitHub UI
+Difference from latest_tenders_widget_scraper.py:
+  * Logs EVERY candidate it sees (title + filter decision), not just matches.
+  * Dumps the first 2000 chars of each portal's HTML to output/debug_<portal>.html
+    so we can inspect what the server actually returned.
+  * Saves ALL rows (match + skip) to output/debug_tenders_all.csv with a
+    "Decision" column — kept / skipped-not-transport / skipped-past-date etc.
 
-jobs:
-  scrape:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write          # needed to commit the CSV back to the repo
-    steps:
-      - name: Checkout repo
-        uses: actions/checkout@v4
+Run on GitHub Actions by replacing the script name in your workflow, or run
+locally. Then look at the committed debug_*.html files and
+debug_tenders_all.csv to see what each portal is actually returning.
+"""
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
+from __future__ import annotations
+import asyncio, re
+from datetime import datetime, date
+from pathlib import Path
+import httpx, pandas as pd
+from bs4 import BeautifulSoup
 
-      - name: Install dependencies
-        run: |
-          pip install httpx beautifulsoup4 pandas lxml
+OUTPUT_DIR = Path("./output")   # repo-local for GitHub Actions
+HTTP_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,*/*;q=0.9",
+    "Accept-Language": "en-IN,en;q=0.9",
+}
+TODAY = datetime.now().strftime("%Y-%m-%d")
 
-      - name: Run widget scraper
-        run: |
-          # Patch OUTPUT_DIR to a repo-local path for CI
-          sed -i 's|OUTPUT_DIR = Path(r"G:.*")|OUTPUT_DIR = Path("./output")|' latest_tenders_widget_scraper.py
-          python latest_tenders_widget_scraper.py
+TRANSPORT_TERMS = [
+    "transport", "transportation", "highway", "expressway", "road",
+    "railway", "rail", "metro", "mrt", "brt", "bus",
+    "port", "airport", "aviation", "maritime", "waterway",
+    "logistics", "multimodal", "freight", "corridor", "bridge",
+    "urban mobility", "public transport", "transit", "traffic",
+    "mobility", "gati shakti", "bharatmala", "sagarmala", "infrastructure",
+    "flyover", "underpass", "subway", "pedestrian",
+]
+CONSULTANCY_TERMS = [
+    "transaction advisor", "transaction advisory", "consultan", "advisor",
+    "advisory", "feasibility", "pre-feasibility", "dpr",
+    "detailed project report", "capacity building", "capacity strengthening",
+    "institutional", "technical assistance", "ppp", "public-private",
+    "bot", "dbfot", "hybrid annuity", "concession",
+    "business model", "business case", "business plan", "business strategy",
+    "revenue model", "policy", "regulatory", "demand study",
+    "financial model", "study", "assessment", "preparation", "survey",
+    "design", "supervision", "audit",
+]
 
-      - name: Commit any new CSV files
-        run: |
-          git config user.name  "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add output/*.csv || true
-          git diff --cached --quiet || git commit -m "Daily tender scrape $(date -u +%Y-%m-%d_%H-%M)"
-          git push || true
+DATE_PATTERN = re.compile(
+    r"\d{1,2}[-/\s][A-Za-z]{3,9}[-/\s]\d{4}(?:\s+\d{1,2}:\d{2}\s*(?:AM|PM)?)?"
+    r"|\d{4}-\d{2}-\d{2}"
+    r"|\d{1,2}/\d{1,2}/\d{4}",
+    re.IGNORECASE,
+)
 
-      - name: Upload CSV as workflow artifact
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: tender-csv-${{ github.run_id }}
-          path: output/*.csv
-          if-no-files-found: ignore
-          retention-days: 30
 
-      # Optional — email the CSV to yourself. Requires repo secrets:
-      #   MAIL_USER (gmail address) and MAIL_PASS (gmail app password).
-      # Uncomment this block if you want it.
-      #
-      # - name: Email the digest
-      #   uses: dawidd6/action-send-mail@v3
-      #   with:
-      #     server_address: smtp.gmail.com
-      #     server_port: 465
-      #     secure: true
-      #     username: ${{ secrets.MAIL_USER }}
-      #     password: ${{ secrets.MAIL_PASS }}
-      #     subject: "Transport Tender Scrape — $(date -u +%Y-%m-%d)"
-      #     to: hello@tenderintelai.org
-      #     from: ${{ secrets.MAIL_USER }}
-      #     body: "Latest transport-consultancy tender scrape attached."
-      #     attachments: output/*.csv
+def classify(title: str) -> tuple[str, list[str]]:
+    t = (title or "").lower()
+    th = [k for k in TRANSPORT_TERMS if k in t]
+    ch = [k for k in CONSULTANCY_TERMS if k in t]
+    if th and ch:
+        return "kept", th[:3] + ch[:3]
+    if th and not ch:
+        return "skip-transport-only", th[:3]
+    if ch and not th:
+        return "skip-consultancy-only", ch[:3]
+    return "skip-no-match", []
+
+
+def parse_date(s: str):
+    s = re.sub(r"\s+", " ", s).strip()
+    for fmt in ("%d-%b-%Y %I:%M %p", "%d-%b-%Y", "%Y-%m-%d",
+                "%d/%m/%Y", "%d-%B-%Y", "%d %b %Y", "%d %B %Y"):
+        try:
+            return datetime.strptime(s[:25], fmt).date()
+        except (ValueError, TypeError):
+            continue
+    return None
+
+
+PORTALS = [
+    ("Nashik Municipal Corp", "https://nmc.gov.in/"),
+    ("Pune Municipal Corp", "https://www.pmc.gov.in/"),
+    ("Mumbai Municipal (BMC)", "https://portal.mcgm.gov.in/"),
+    ("Chennai Corporation", "https://chennaicorporation.gov.in/"),
+    ("NHAI", "https://nhai.gov.in/"),
+    ("Indian Railways IREPS", "https://www.ireps.gov.in/"),
+    ("DMRC", "https://www.delhimetrorail.com/tenders"),
+    ("CMRL", "https://chennaimetrorail.org/tenders/"),
+    ("BMRCL", "https://english.bmrc.co.in/Tenders"),
+    ("MMRC", "https://www.mmrcl.com/en/tenders"),
+    ("Chennai Port", "https://www.chennaiport.gov.in/tenders"),
+    ("JNPT", "https://www.jnport.gov.in/tenders"),
+]
+
+
+async def debug_portal(client: httpx.AsyncClient, portal: str, url: str) -> list[dict]:
+    rows: list[dict] = []
+    print(f"\n{'='*70}\n[{portal}] {url}\n{'='*70}")
+
+    try:
+        r = await client.get(url, timeout=30, headers=HTTP_HEADERS,
+                             follow_redirects=True)
+        print(f"  HTTP {r.status_code}, body size: {len(r.text):,} bytes")
+    except Exception as e:
+        print(f"  FETCH ERROR: {e}")
+        rows.append({"Portal": portal, "URL": url, "Decision": "fetch-error",
+                     "Note": str(e)[:200]})
+        return rows
+
+    # Save raw HTML for inspection
+    safe_name = re.sub(r"[^A-Za-z0-9]+", "_", portal).strip("_")
+    debug_html = OUTPUT_DIR / f"debug_{safe_name}.html"
+    debug_html.write_text(r.text[:50000], encoding="utf-8", errors="ignore")
+    print(f"  → saved first 50KB of HTML to {debug_html.name}")
+
+    soup = BeautifulSoup(r.text, "lxml")
+
+    # Count what we see
+    all_tables = soup.find_all("table")
+    tender_tables = [t for t in all_tables
+                     if "tender" in t.get_text(" ", strip=True).lower()[:300]]
+    print(f"  Tables found: {len(all_tables)} total, {len(tender_tables)} contain 'tender'")
+
+    all_links = soup.find_all("a", href=True)
+    tender_links = [a for a in all_links
+                    if "tender" in a.get("href", "").lower()
+                    or "tender" in a.get_text(strip=True).lower()]
+    print(f"  Links found: {len(all_links)} total, {len(tender_links)} mention 'tender'")
+
+    # Try to extract candidates from any table
+    candidates = []
+    for table in all_tables:
+        for row in table.find_all("tr"):
+            cells = row.find_all(["td", "th"])
+            if len(cells) < 2:
+                continue
+            texts = [c.get_text(" ", strip=True) for c in cells]
+            full = " | ".join(texts)
+            if len(full) < 15:
+                continue
+            # Must look like data (has a date or a tender ID pattern)
+            if not (DATE_PATTERN.search(full) or re.search(r"[A-Z]{2,}[-/]\d+", full)):
+                continue
+
+            a = row.find("a")
+            title = a.get_text(" ", strip=True) if a else max(texts, key=len)
+            title = re.sub(r"\s+", " ", re.sub(r"^\s*\d+\.\s*", "", title))
+            if len(title) < 8:
+                continue
+
+            candidates.append({"source": "table", "title": title, "full": full})
+
+    # Also check <ul>/<ol>/<div> lists under "Latest Tenders" headers
+    headers = soup.find_all(["h1", "h2", "h3", "h4", "div"],
+                            string=re.compile(r"latest\s+tenders?|current\s+tenders?|active\s+tenders?",
+                                              re.IGNORECASE))
+    for h in headers:
+        container = h.find_next(["ul", "ol", "div", "table"])
+        if not container:
+            continue
+        for item in (container.find_all("li") or container.find_all("a", href=True))[:50]:
+            text = re.sub(r"\s+", " ", item.get_text(" ", strip=True))
+            if len(text) >= 15:
+                candidates.append({"source": "list", "title": text[:200], "full": text})
+
+    print(f"  Candidate rows extracted: {len(candidates)}")
+
+    # Classify each
+    kept = 0
+    for c in candidates[:50]:  # cap display at 50
+        decision, kw = classify(c["title"])
+        if decision == "kept":
+            kept += 1
+            marker = "✓"
+        else:
+            marker = " "
+        print(f"    {marker} [{decision:25s}] {c['title'][:100]}")
+        if kw:
+            print(f"       keywords: {kw}")
+        rows.append({
+            "Portal": portal, "URL": url,
+            "Source Pattern": c["source"],
+            "Title": c["title"][:200],
+            "Decision": decision,
+            "Matched Keywords": ", ".join(kw),
+            "Full Row Text": c["full"][:300],
+        })
+
+    print(f"  → {kept} transport-consultancy matches out of {len(candidates)} candidates")
+    return rows
+
+
+async def main():
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    all_debug: list[dict] = []
+
+    async with httpx.AsyncClient(follow_redirects=True) as client:
+        for portal, url in PORTALS:
+            try:
+                rows = await debug_portal(client, portal, url)
+                all_debug.extend(rows)
+            except Exception as e:
+                print(f"[{portal}] FATAL: {e}")
+
+    if all_debug:
+        out = OUTPUT_DIR / "debug_tenders_all.csv"
+        pd.DataFrame(all_debug).to_csv(out, index=False, encoding="utf-8-sig")
+        print(f"\n{'='*70}\nSaved {len(all_debug)} debug rows → {out}")
+        kept = sum(1 for r in all_debug if r["Decision"] == "kept")
+        print(f"Of those, {kept} would have passed the transport+consultancy filter.\n")
+
+        # Breakdown of decisions
+        from collections import Counter
+        decisions = Counter(r["Decision"] for r in all_debug)
+        print("Decision breakdown:")
+        for d, n in decisions.most_common():
+            print(f"  {d}: {n}")
+    else:
+        print("\nNo candidate rows found on any portal — see debug_*.html files.")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
