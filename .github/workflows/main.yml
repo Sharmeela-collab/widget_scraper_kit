@@ -1,0 +1,64 @@
+name: Scrape Transport Tenders
+
+on:
+  schedule:
+    - cron: "0 */6 * * *"
+  workflow_dispatch:
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install httpx beautifulsoup4 pandas lxml
+
+      - name: Create output directory
+        run: mkdir -p output
+
+      - name: Patch OUTPUT_DIR for Linux
+        run: |
+          python -c "
+          import re
+          from pathlib import Path
+          for name in ['latest_tenders_widget_scraper.py', 'widget_scraper_debug.py']:
+              p = Path(name)
+              if p.exists():
+                  text = p.read_text()
+                  text = re.sub(r'OUTPUT_DIR\s*=\s*Path\(r?\"G:[^\"]+\"\)', 'OUTPUT_DIR = Path(\"./output\")', text)
+                  p.write_text(text)
+                  print(f'Patched {name}')
+          "
+
+      - name: Run widget scraper
+        run: python widget_scraper_debug.py
+        continue-on-error: true
+
+      - name: List output folder
+        run: ls -la output/ || echo "output folder is empty"
+
+      - name: Commit any new files
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add output/ || true
+          git diff --cached --quiet && echo "nothing to commit" || git commit -m "Scrape run $(date -u +%Y-%m-%d_%H-%M)"
+          git push || true
+
+      - name: Upload CSV as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tender-output-${{ github.run_id }}
+          path: output/*
+          if-no-files-found: ignore
+          retention-days: 30
